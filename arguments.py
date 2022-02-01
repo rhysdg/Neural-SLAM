@@ -32,6 +32,10 @@ def get_args():
     parser.add_argument('--train_slam', type=int, default=1,
                         help="""0: Do not train the Neural SLAM Module
                                 1: Train the Neural SLAM Module (default: 1)""")
+                                
+    # moving objects
+    parser.add_argument('--dynamic_obj', type=int, default=1,
+                        help="1: add moving objects in the simulation env.")
 
     # Logging, loading models, visualization
     parser.add_argument('--log_interval', type=int, default=10,
@@ -76,6 +80,9 @@ def get_args():
                                 Doom (default: 180)""")
     parser.add_argument("--sim_gpu_id", type=int, default=0,
                         help="gpu id on which scenes are loaded")
+    parser.add_argument("--sem_gpu_id", type=int, default=0,    #-1
+                        help="""gpu id for semantic model,
+                                -1: same as sim gpu, -2: cpu""")
     parser.add_argument("--task_config", type=str,
                         default="tasks/pointnav_gibson.yaml",
                         help="path to config yaml containing task information")
@@ -163,6 +170,19 @@ def get_args():
     parser.add_argument('-ct', '--collision_threshold', type=float, default=0.20)
     parser.add_argument('-nl', '--noise_level', type=float, default=1.0)
 
+    # add some arguments for semantic mapping
+    parser.add_argument('--cat_pred_threshold', type=float, default=5.0)
+    #parser.add_argument('--map_pred_threshold', type=float, default=1.0)
+    parser.add_argument('--exp_pred_threshold', type=float, default=1.0)
+    #parser.add_argument('--collision_threshold', type=float, default=0.20)
+    parser.add_argument('--reward_coeff', type=float, default=0.1,
+                        help="Object goal reward coefficient")
+    parser.add_argument('--intrinsic_rew_coeff', type=float, default=0.02,
+                        help="intrinsic exploration reward coefficient")
+    parser.add_argument('--num_sem_categories', type=float, default=16)  #default for 2, moving obj and movable obj
+    parser.add_argument('--sem_pred_prob_thr', type=float, default=0.9,
+                        help="Semantic prediction confidence threshold")
+
     # parse arguments
     args = parser.parse_args()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -175,6 +195,7 @@ def get_args():
             elif "gibson" in args.task_config and \
                     "train" in args.split:
                 args.total_num_scenes = 72
+                #args.total_num_scenes = 14
             elif "gibson" in args.task_config and \
                     "val_mt" in args.split:
                 args.total_num_scenes = 14
@@ -189,16 +210,31 @@ def get_args():
             # number of GPUs available and GPU memory size
             total_num_scenes = args.total_num_scenes
             gpu_memory = 1000
+            #GPU memory required per thread: (assumed) 2.6GB
+            min_memory_required = max(0.8 + 0.4*total_num_scenes, 2.6)
+            min_memory_required = 2.6
+            print(f"min memory required: {min_memory_required}")
             for i in range(num_gpus):
                 gpu_memory = min(gpu_memory,
                     torch.cuda.get_device_properties(i).total_memory \
-                            /1024/1024/1024)
+                            /1024/1024/1024)        #8.7
                 if i==0:
                     assert torch.cuda.get_device_properties(i).total_memory \
-                            /1024/1024/1024 > 10.0, "Insufficient GPU memory"
+                            /1024/1024/1024 > 2.6, "Insufficient GPU memory"
 
-            num_processes_per_gpu = int(gpu_memory/1.4)
-            num_processes_on_first_gpu = int((gpu_memory - 10.0)/1.4)
+            print(f'gpu_memory{gpu_memory}')
+            num_processes_per_gpu = int(gpu_memory/2.6)     #6
+            print(f'num_processes_per_gpu  {num_processes_per_gpu}')
+            #num_processes_on_first_gpu = int((gpu_memory - 10.0)/1.4)
+            # num_processes_on_first_gpu = int((gpu_memory - 5.0)/1.4)
+            num_processes_on_first_gpu = \
+                int((gpu_memory - min_memory_required) / 2.6)
+            # num_processes_on_first_gpu = \
+            #     int((gpu_memory - min_memory_required)/1.4)
+            #! for testing set it to 1
+            #num_processes_on_first_gpu = int(gpu_memory/1.47)
+
+            # num_processes_per_gpu = int(gpu_memory/1.4)
 
             if num_gpus == 1:
                 args.num_processes_on_first_gpu = num_processes_on_first_gpu
