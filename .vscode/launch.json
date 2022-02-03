@@ -1,0 +1,19 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args":["--train_global","0","--train_local","0","--train_slam","1","--load_global",
+                "pretrained_models/model_best.global","--load_local","pretrained_models/model_best.local",
+                "--total_num_scenes","1","--load_slam","pretrained_models/model_best.slam",
+                "--print_images", "1"]
+        }
+    ]
+}
