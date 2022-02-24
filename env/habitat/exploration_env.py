@@ -1,9 +1,13 @@
+from collections import deque
 import math
 import os
 import pickle
 from pickletools import float8
 import sys
 from cv2 import threshold
+import time
+
+import magnum as mn
 
 import gym
 import habitat_sim
@@ -43,6 +47,10 @@ from model import get_grid
 from env.habitat.utils.semantic_prediction import SemanticPredMaskRCNN
 import math
 
+from habitat_sim.nav import NavMeshSettings
+
+
+
 def _preprocess_depth(depth):
     depth = depth[:, :, 0]*1
     mask2 = depth > 0.99
@@ -75,23 +83,24 @@ class Exploration_Env(habitat.RLEnv):
 
         self.sem_pred = SemanticPredMaskRCNN(args)
 
-        self.obj_num = 5
 
-        #-----objects related initialzation-----#
-        self.sim_count = 0
-        self.sim_object_to_objid_mapping = {}
-        self.object_positions = []
-        self.object_ids = []
-        self.objects = []
-        self.object_scene_nodes = []
-        self.path_step = 0
-        self.path = []
-        self.direction = 1
-        self.object_cur_loc = None
         
-
+        self.x = None
+        self.y = None
+        self.o = None
+        self.sim_map = None
         #self._initialize_object()
 
+
+        self.navmesh_settings = NavMeshSettings()
+        self.navmesh_settings.set_defaults()
+        self.navmesh_settings.agent_radius = 0.1
+        self.navmesh_settings.agent_height = 1.5
+
+
+        self.pose_loss = deque(maxlen=1000)
+
+        self.so = 0  # number of static objects thats potenially movable after certain ts.
 
 
         self.sensor_noise_fwd = \
@@ -112,7 +121,7 @@ class Exploration_Env(habitat.RLEnv):
         config_env.defrost()
         config_env.SIMULATOR.ACTION_SPACE_CONFIG = \
                 "CustomActionSpaceConfiguration"
-                
+        config_env.SIMULATOR.ENABLE_PHYSICS = True
         config_env.freeze()
 
 
@@ -135,7 +144,9 @@ class Exploration_Env(habitat.RLEnv):
         self.scene_name = None
         self.maps_dict = {}
 
-        self._initialize_object()
+        #self._initialize_object()
+
+
 
     def randomize_env(self):
         self._env._episode_iterator._shuffle_iterator()
@@ -164,35 +175,95 @@ class Exploration_Env(habitat.RLEnv):
 
 
     def _get_sem_pred(self, rgb, use_seg=True):
+        #! to debug not using detectron for now
+        # use_seg = self.args.use_seg
+        # self.use_seg = use_seg
         if use_seg:
             semantic_pred, self.rgb_vis = self.sem_pred.get_prediction(rgb)
-            semantic_pred = semantic_pred.astype(np.float32)
+            semantic_pred = semantic_pred.astype(np.float32)        #(128,128,16)
+            #pass
         else:
             semantic_pred = np.zeros((rgb.shape[0], rgb.shape[1], 16))
             self.rgb_vis = rgb[:, :, ::-1]
         return semantic_pred
 
-    def _preprocess_obs(self, obs, use_seg=True):
+    def _preprocess_obs(self, rgb, depth, semantic, use_seg):
+
+        # if args.use_seg == False:
+        #     self.semantic = obs['semantic']
+
+
+        # #!TODO get the correct semantic segmantation
+        # #sem_seg_pred.shape(128,128,16)
+        # sem_seg_pred = self._get_sem_pred(
+        #     rgb.astype(np.uint8), use_seg=True)
+
+
+        # # Preprocess semantic observations
+        # # First downscaling 
+        # ds = args.env_frame_width // args.frame_width  # Downscaling factor
+        # if ds != 1:
+        #     depth_sem = depth[ds // 2::ds, ds // 2::ds]
+        # depth_sem = np.expand_dims(depth_sem, axis=2)
+
+
+        # #depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+        # state = np.concatenate((rgb,depth_sem,sem_seg_pred),axis=2).transpose(2,0,1)
+
         args = self.args
-        obs = obs.transpose(1, 2, 0)
-        rgb = obs[:, :, :3]
-        depth = obs[:, :, 3:4]
-
-        sem_seg_pred = self._get_sem_pred(
-            rgb.astype(np.uint8), use_seg=use_seg)
-        depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
-
+        #depth = _preprocess_depth(depth)
         ds = args.env_frame_width // args.frame_width  # Downscaling factor
         if ds != 1:
-            rgb = np.asarray(self.res(rgb.astype(np.uint8)))
+            #rgb = np.asarray(self.res(rgb.astype(np.uint8)))
             depth = depth[ds // 2::ds, ds // 2::ds]
-            sem_seg_pred = sem_seg_pred[ds // 2::ds, ds // 2::ds]
+            semantic = semantic[ds // 2::ds, ds // 2::ds]
+            #semantic = np.array(self.res(semantic.astype(np.uint8)))
+        #obs = obs.transpose(1, 2, 0)
+        # rgb = obs[:, :, :3]
+        # depth = obs[:, :, 3:4]
+        #sem_seg_pred = semantic
 
-        depth = np.expand_dims(depth, axis=2)
-        state = np.concatenate((rgb, depth, sem_seg_pred),
-                               axis=2).transpose(2, 0, 1)
+        if use_seg == 1: # use gt segmantation
+            #objects_sem_id = self.objects_semantic_id
+            objects_sem_id = 10
+            mask_semantic = semantic == objects_sem_id
+
+            # apply semantic mask on to rgb and depth obs, before feeding to n-slam.
+            rgb[mask_semantic] = 0.
+            # self.obs = rgb
+            # self.sem = mask_semantic
+            self.obs = mask_semantic
+            depth[mask_semantic] = 0.
+            depth = np.expand_dims(depth, axis=2)
+            semantic = np.expand_dims(semantic, axis=2)
+            state = np.concatenate((rgb, depth, semantic),
+                                axis=2).transpose(2, 0, 1)
+        
+        elif use_seg == 2:  # use mask rcnn segmantation (detectron)
+            sem_seg_pred = self._get_sem_pred(
+                rgb.astype(np.uint8), use_seg=True)
+
+            # if ds != 1:
+            #     sem_seg_pred = sem_seg_pred[ds // 2::ds, ds // 2::ds]
+
+            depth = np.expand_dims(depth, axis=2)
+            semantic = np.expand_dims(semantic, axis=2)
+            self.sem = sem_seg_pred
+            state = np.concatenate((rgb, depth, sem_seg_pred),
+                                axis=2).transpose(2, 0, 1)
+
+        else:   # do not use any segmantation
+            depth = np.expand_dims(depth, axis=2)
+            semantic = np.expand_dims(semantic, axis=2)
+            state = np.concatenate((rgb, depth, semantic),
+                                axis=2).transpose(2, 0, 1)
 
         return state
+
+    def reconfigure(self, config):
+        super().reconfigure(config)
+        print('debug in reconfigure')
+
 
     def reset(self):
         args = self.args
@@ -200,6 +271,24 @@ class Exploration_Env(habitat.RLEnv):
         self.timestep = 0
         self._previous_action = None
         self.trajectory_states = []
+
+        self.sim_count = 0
+        self.sim_object_to_objid_mapping = {}
+        self.object_positions = []
+        self.object_ids = []
+        self.objects = []
+        self.object_scene_nodes = []
+        self.path_step = 0
+        self.path = []
+        self.object_cur_loc = None
+        self.obj_num = 10
+        self.step_count = 0
+        self.path_step = []
+        self.direction = []
+        for i in range(self.obj_num):
+            self.path_step.append(0)
+            self.direction.append(1)
+
 
         if args.randomize_env_every > 0:
             if np.mod(self.episode_no, args.randomize_env_every) == 0:
@@ -212,8 +301,16 @@ class Exploration_Env(habitat.RLEnv):
         self.explorable_map = None
         while self.explorable_map is None:
             obs = super().reset()
+
+            #some variables to init objects 
+            #-----objects related initialzation-----#
+
+            #self._initialize_object()
+
+
             full_map_size = args.map_size_cm//args.map_resolution
             self.explorable_map = self._get_gt_map(full_map_size)
+            #self.reconfigure()
         self.prev_explored_area = 0.
 
         # Preprocess observations
@@ -222,26 +319,36 @@ class Exploration_Env(habitat.RLEnv):
         self.obs = rgb # For visualization
         if self.args.frame_width != self.args.env_frame_width:
             rgb = np.asarray(self.res(rgb))
-        #state = rgb.transpose(2, 0, 1)
         depth = _preprocess_depth(obs['depth'])
+        semantic = obs['semantic'].astype(np.uint8)
+        #state = rgb.transpose(2, 0, 1)
+        
+        #state = np.concatenate((rgb, depth), axis=2).transpose(2, 0, 1)
+        use_seg = self.args.use_seg
+        
+        state = self._preprocess_obs(rgb, depth, semantic, use_seg=use_seg)
 
 
-        #!TODO get the correct semantic segmantation
-        #sem_seg_pred.shape(128,128,16)
-        sem_seg_pred = self._get_sem_pred(
-            rgb.astype(np.uint8), use_seg=True)
+        # if args.use_seg == False:
+        #     self.semantic = obs['semantic']
 
 
-        # Preprocess semantic observations
-        # First downscaling 
-        ds = args.env_frame_width // args.frame_width  # Downscaling factor
-        if ds != 1:
-            depth_sem = depth[ds // 2::ds, ds // 2::ds]
-        depth_sem = np.expand_dims(depth_sem, axis=2)
+        # #!TODO get the correct semantic segmantation
+        # #sem_seg_pred.shape(128,128,16)
+        # sem_seg_pred = self._get_sem_pred(
+        #     rgb.astype(np.uint8), use_seg=True)
 
 
-        #depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
-        state = np.concatenate((rgb,depth_sem,sem_seg_pred),axis=2).transpose(2,0,1)
+        # # Preprocess semantic observations
+        # # First downscaling 
+        # ds = args.env_frame_width // args.frame_width  # Downscaling factor
+        # if ds != 1:
+        #     depth_sem = depth[ds // 2::ds, ds // 2::ds]
+        # depth_sem = np.expand_dims(depth_sem, axis=2)
+
+
+        # #depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+        # state = np.concatenate((rgb,depth_sem,sem_seg_pred),axis=2).transpose(2,0,1)
 
 
         # Initialize map and pose 
@@ -257,12 +364,11 @@ class Exploration_Env(habitat.RLEnv):
 
         #! Initializa object map
 
-        # try to get object position
-        if len(self.path)>0 :
-            obj_sim_pos = self.path[0].points[0]
-            dxo_gt, dyo_gt, doo_gt = pu.get_rel_pose_change(self.last_sim_location, self.get_object_location(obj_sim_pos))
-            self.object_cur_loc = pu.get_new_pose(self.curr_loc_gt,
-                                (dxo_gt, dyo_gt, doo_gt))
+        # # try to get object position
+        # obj_sim_pos = self.path[0].points[0]
+        # dxo_gt, dyo_gt, doo_gt = pu.get_rel_pose_change(self.last_sim_location, self.get_object_location(obj_sim_pos))
+        # self.object_cur_loc = pu.get_new_pose(self.curr_loc_gt,
+        #                        (dxo_gt, dyo_gt, doo_gt))
 
         # Convert pose to cm and degrees for mapper
         mapper_gt_pose = (self.curr_loc_gt[0]*100.0,
@@ -289,29 +395,64 @@ class Exploration_Env(habitat.RLEnv):
             'fp_explored': fp_explored,
             'sensor_pose': [0., 0., 0.],
             'pose_err': [0., 0., 0.],
+            'pose_loss':  0.,
         }
 
         self.save_position()
 
+
         return state, self.info
         #return obs, self.info
+
 
     def step(self, action):
 
         args = self.args
         self.timestep += 1
+    
+        full_map_size = args.map_size_cm//args.map_resolution
+        
+        # count step
+        self.step_count += 1
 
-        if len(self.objects)>0:
+        # print('========================================')
+        # print(f'step count is {self.step_count}')
+        # print('========================================')
+
+
+        if self.step_count % 10 == 0:
+            self.vel_control.linear_velocity = -1 * self.vel_control.linear_velocity
+
+        if self.step_count > 300:
+            self.so = 1
+
+        elif self.step_count > 600:
+            self.so = 2
+
         # moving object within each step
-            for i in range(len(self.objects)):
-                if self.direction and self.path_step  < len(self.path[i].points):
-                    self.objects[i].translation = np.array(self.path[i].points[self.path_step])
-                    self.path_step += 1
-                elif self.path_step ==0 or self.path_step == len(self.path[i].points):
-                    self.direction = -1 * self.direction
-                elif not self.direction and self.path_step > 0:
-                    self.objects[i].translation = np.array(self.path[i].points[self.path_step])
-                    self.path_step -= 1
+        if args.dynamic:
+            for i in range(len(self.objects) - self.so):
+                if self.direction[i]==1 and self.path_step[i]  < len(self.path[i].points):
+                    self.objects[i].translation = np.array(self.path[i].points[self.path_step[i]])
+                    self.path_step[i] += 1
+                elif self.direction[i]==-1 and self.path_step[i] > 0:
+                    self.objects[i].translation = np.array(self.path[i].points[self.path_step[i]])
+                    self.path_step[i] -= 1
+                elif self.path_step[i] ==0:
+                    self.direction[i] = -1 * self.direction[i]
+                elif self.path_step[i] == len(self.path[i].points):
+                    self.direction[i] = -1 * self.direction[i]
+                    self.path_step[i] -= 1
+
+
+                # if i == 0:
+        
+        #print("object id: 0 is at the location %s" %([self.objects[0].translation.r, self.objects[0].translation.b]))
+
+            # print(f'object sim location {}')
+
+            #! takes too much time, FPS drops down lower than 1.
+            # obj_x, obj_y = self._get_topdown_point(full_map_size, i)
 
         # Action remapping
         if action == 2: # Forward
@@ -337,31 +478,45 @@ class Exploration_Env(habitat.RLEnv):
         else:
             obs, rew, done, info = super().step(action)
 
-        # Preprocess observations
+
         rgb = obs['rgb'].astype(np.uint8)
+        depth = _preprocess_depth(obs['depth'])
+        semantic = obs['semantic'].astype(np.uint8)
+
         self.obs = rgb # For visualization
         if self.args.frame_width != self.args.env_frame_width:
             rgb = np.asarray(self.res(rgb))
 
+        #state = np.concatenate((rgb, depth), axis=2).transpose(2, 0, 1)
+        use_seg = self.args.use_seg
+        
+        state = self._preprocess_obs(rgb, depth, semantic, use_seg=use_seg)
 
-        #TODO concatenate depth layer and semantic seg
-        depth = _preprocess_depth(obs['depth'])
+        
 
-        #sem_seg_pred.shape(128,128,16)
-        sem_seg_pred = self._get_sem_pred(
-            rgb.astype(np.uint8), use_seg=True)
+        #obs = obs.transpose(1, 2, 0)
+        # rgb = obs[:, :, :3]
+        #self.obs = state.transpose(1,2,0)[:,:,3]
+
+
+        # #TODO concatenate depth layer and semantic seg
+        # depth = _preprocess_depth(obs['depth'])
+
+        # #sem_seg_pred.shape(128,128,16)
+        # sem_seg_pred = self._get_sem_pred(
+        #     rgb.astype(np.uint8), use_seg=self.args.use_seg)
 
 
         # Preprocess semantic observations
         # First downscaling 
-        ds = args.env_frame_width // args.frame_width  # Downscaling factor
-        if ds != 1:
-            depth_sem = depth[ds // 2::ds, ds // 2::ds]
-        depth_sem = np.expand_dims(depth_sem, axis=2)
+        # ds = args.env_frame_width // args.frame_width  # Downscaling factor
+        # if ds != 1:
+        #     depth_sem = depth[ds // 2::ds, ds // 2::ds]
+        # depth_sem = np.expand_dims(depth_sem, axis=2)
 
 
-        #depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
-        state = np.concatenate((rgb,depth_sem,sem_seg_pred),axis=2).transpose(2,0,1)
+        # #depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+        # state = np.concatenate((rgb,depth_sem,sem_seg_pred),axis=2).transpose(2,0,1)
 
 
         #state = rgb.transpose(2, 0, 1)
@@ -430,7 +585,7 @@ class Exploration_Env(habitat.RLEnv):
         self.info['pose_err'] = [dx_gt - dx_base,
                                  dy_gt - dy_base,
                                  do_gt - do_base]
-
+        self.info['pose_loss'] = 0.
 
         if self.timestep%args.num_local_steps==0:
             area, ratio = self.get_global_reward()
@@ -444,11 +599,13 @@ class Exploration_Env(habitat.RLEnv):
 
         if self.info['time'] >= args.max_episode_length:
             done = True
+            self.step_count = 0
             if self.args.save_trajectory_data != "0":
                 self.save_trajectory_data()
         else:
             done = False
 
+        
         return state, rew, done, self.info
 
     def get_reward_range(self):
@@ -691,28 +848,15 @@ class Exploration_Env(habitat.RLEnv):
             if not os.path.exists(ep_dir):
                 os.makedirs(ep_dir)
 
-
-            # obj_x, obj_y, obj_z = self.objects[0].translation.b, \
-            #     self.objects[0].translation.g ,self.objects[0].translation.r
-            # obj_sim_pos = [obj_x, obj_y, obj_z]
-            # dxo_gt, dyo_gt, doo_gt = pu.get_rel_pose_change(self.last_sim_location, self.get_object_location(obj_sim_pos))
-            # object_cur_loc = pu.get_new_pose(self.curr_loc_gt,
-            #                     (dxo_gt, dyo_gt, doo_gt))
-
-            # goal_ = [0, 0]
-            # goal_[0], goal_[1], _ = object_cur_loc
-            # goal_[0] = int(goal_[0] * 10)
-            # goal_[1] = int(goal_[1] * 10)
-
             if args.vis_type == 1: # Visualize predicted map and pose
                 #! TESTING
                 #! TODO
                 # 1. caculate the rel distance between agent sim location and object sim location
                 #           at EACH timestep before feeded into vu.get_color_map
-                goal[0], goal[1], _ = self.object_cur_loc
+                #goal[0], goal[1], _ = self.object_cur_loc
 
                         # try to get object position
-                obj_sim_pos = self.path[0].points[0]
+                #obj_sim_pos = self.path[0].points[0]
                 obj_x, obj_y, obj_z = self.objects[0].translation.b, \
                     self.objects[0].translation.g ,self.objects[0].translation.r
                 obj_sim_pos = [obj_x, obj_y, obj_z]
@@ -721,15 +865,16 @@ class Exploration_Env(habitat.RLEnv):
                                     (dxo_gt, dyo_gt, doo_gt))
 
                 goal_ = [0, 0]
+                #goal_[0], goal_[1], _ = self.object_cur_loc
                 goal_[0], goal_[1], _ = object_cur_loc
-                goal_[0] = int(goal_[0] * 10)
-                goal_[1] = int(goal_[1] * 10)
+                goal_[0] = int(goal_[0])
+                goal_[1] = int(goal_[1])
                 vis_grid = vu.get_colored_map(np.rint(map_pred),
                                 self.collison_map[gx1:gx2, gy1:gy2],
                                 self.visited_vis[gx1:gx2, gy1:gy2],
                                 self.visited_gt[gx1:gx2, gy1:gy2],
-                                #goal,
-                                goal_,
+                                goal,
+                                #goal_,
                                 self.explored_map[gx1:gx2, gy1:gy2],
                                 self.explorable_map[gx1:gx2, gy1:gy2],
                                 self.map[gx1:gx2, gy1:gy2] *
@@ -743,21 +888,32 @@ class Exploration_Env(habitat.RLEnv):
                 px = (x_ - bounds[0][0]) * 24
                 py = (y_ - bounds[0][2]) * 24
                 vis_grid_ = vis_grid[:,:,::-1]      #(240,240,2), first two channels of vis_grid
+                self.predicted_pose = torch.from_numpy(np.array([start_x - gy1*args.map_resolution/100.0,
+                                start_y - gx1*args.map_resolution/100.0]
+                                ))
+                self.gt_pose = torch.from_numpy(np.array([start_x_gt - gy1*args.map_resolution/100.0,
+                                start_y_gt - gx1*args.map_resolution/100.0]
+                                ))
+                pose_loss = torch.nn.MSELoss()(
+                        self.predicted_pose,
+                        self.gt_pose
+                )
+                self.info['pose_loss'] = pose_loss
+
+                if self.step_count % self.args.log_interval == 0:
+                    print("Loss at time step {} is {:.4f}".format(self.step_count, pose_loss.item()))
+                
                 vu.visualize(self.figure, self.ax, self.obs, vis_grid[:,:,::-1],
                             (start_x - gy1*args.map_resolution/100.0,
-                             start_y - gx1*args.map_resolution/100.0,
-                             start_o),
-                            #  (
-                            #      object_cur_loc[0]- gy1*args.map_resolution/100.0,
-                            #       object_cur_loc[1] - gx1*args.map_resolution/100.0,
-                            #       start_o_gt
-                            #  ),
+                            start_y - gx1*args.map_resolution/100.0,
+                            start_o),
                             (start_x_gt - gy1*args.map_resolution/100.0,
-                             start_y_gt - gx1*args.map_resolution/100.0,
-                             start_o_gt),
+                            start_y_gt - gx1*args.map_resolution/100.0,
+                            start_o_gt),
                             dump_dir, self.rank, self.episode_no,
                             self.timestep, args.visualize,
                             args.print_images, args.vis_type)
+
 
             else: # Visualize ground-truth map and pose
                 vis_grid = vu.get_colored_map(self.map,
@@ -771,7 +927,6 @@ class Exploration_Env(habitat.RLEnv):
                 vis_grid = np.flipud(vis_grid)
                 vu.visualize(self.figure, self.ax, self.obs, vis_grid[:,:,::-1],
                             (start_x_gt, start_y_gt, start_o_gt),
-                            # (goal_[0], goal_[1], start_o_gt),
                             (start_x_gt, start_y_gt, start_o_gt),
                             dump_dir, self.rank, self.episode_no,
                             self.timestep, args.visualize,
@@ -794,99 +949,60 @@ class Exploration_Env(habitat.RLEnv):
         agent_y = self._env.sim.get_agent_state().position.tolist()[1]*100.
         sim_map = self.map_obj.get_map(agent_y, -50., 50.0)
 
-        sim_map[sim_map > 0] = 1.
+        sim_map[sim_map > 0] = 1.       #(287,187)
 
-        map_to_save = np.array(sim_map)
-        map_dir = "data/results/neural_slam"
-        np.save(
-             os.path.join(map_dir,'sim_map.npy'),
-             map_to_save
-        )
-
-        # get object sim location
-        # object_sim_pos = []
-        # for point in self.path[0].points[0]:
-        #     position = np.array([-point[2], -point[0]])
-        #     object_sim_pos.append(position)
+        self.sim_map = sim_map
 
 
-        # convert points to topdown map
-        points_topdown = []
-        bounds = self.habitat_env.sim.pathfinder.get_bounds()
-        min_x, min_y = self.map_obj.origin/100.0
-        # for pos in object_sim_pos:
-        #     px = (- pos[0] - min_x) * 20
-        #     py = (- pos[1] - min_y) * 20
-        #     points_topdown.append(np.array([px, py]))
 
+        # Transform the map to align with the agent
+        min_x, min_y = self.map_obj.origin/100.0        # (-8.53, -12.04)  sim map origin in sim coordinates
+        x, y, o = self.get_sim_location()       # return initial agent sim position (7.23, -1.55,0.68)
+        x, y = -x - min_x, -y - min_y       # (1.29, 13.59)
+        if self.x is None:
+            self.x, self.y, self.o = x, y, o
 
-        # for point in points_topdown:
-        #     # sim_map[
-        #     #     int(point[1]) - 2 : int(point[1]) + 2,
-        #     #     int(point[0]) - 2  : int(point[0]) + 2
-        #     # ] = 5
-        #     sim_map[
-        #         int(point[1]), int(point[0])
-        #     ] = 5
-
-        
-        agent_state = super().habitat_env.sim.get_agent_state(0)
-        agent_x = -agent_state.position[2]
-        agent_y = -agent_state.position[0]
-        agent_x, agent_y = (-agent_x -min_x) * 20 , (-agent_y - min_y) * 20 
+        #! print initial agent position and  origin in topdown map
+        agent_state = self._env.sim.get_agent_state(0)
+        agent_x, agent_y = -agent_state.position[2], -agent_state.position[0]
+        agent_x, agent_y = (-agent_x - min_x) * 20, (-agent_y - min_y) * 20
         sim_map[
-            int(agent_y), int(agent_x)
+            int(agent_y) - 5: int(agent_y) + 5,
+            int(agent_x) - 5: int(agent_x) + 5
         ] = 5
 
 
-        print("==========================================================")
+        ori_x, ori_y = self.map_obj.origin/100.0
+        ori_x, ori_y = (-ori_x - min_x) * 20, (-ori_y - min_y) * 20     #(226,548)
+        sim_map[
+            int(ori_y) - 5: int(ori_y) + 5,
+            int(ori_x) - 5: int(ori_x) + 5
+        ] = 10
 
-        print(f"points_topdown: {points_topdown}")
-        print("==========================================================")
-        # min_x, min_y = self.map_obj.origin/100.0
-        # min_x, min_y = -min_x*20, -min_y*20
-        # range_x, range_y = self.map_obj.max/100. - self.map_obj.origin/100.
-
-        # sim_map[
-        #     int(min_x)-10: int(min_x) +10,
-        #     int(min_y)-10: int(min_y) + 10
-        # ] = 5        
-
-
-        print("==========================================================")
-        print(f"sim origin: { min_x, min_y}")
-        print(f"agent initial sim position: {self.get_sim_location()}")
-        print(f"agent local bound: {agent_y, agent_x}")
-        print("==========================================================")
 
 
         map_dir = "data/results/neural_slam"
         np.save(
-             os.path.join(map_dir,'sim_map_o.npy'),
+             os.path.join(map_dir,'sim_map.npy'),
              sim_map
         )
 
 
-        # Transform the map to align with the agent
-        min_x, min_y = self.map_obj.origin/100.0
-        x, y, o = self.get_sim_location()
-        x, y = -x - min_x, -y - min_y
-        range_x, range_y = self.map_obj.max/100. - self.map_obj.origin/100.
+        # self.map_obj.max = ([81,205]) origin([-853,-1204])
+        range_x, range_y = self.map_obj.max/100. - self.map_obj.origin/100.     #(9.34, 14.09) map size in meters?
 
         map_size = sim_map.shape
         scale = 2.
-        grid_size = int(scale*max(map_size))
-        grid_map = np.zeros((grid_size, grid_size))
+        grid_size = int(scale*max(map_size))      # 564
+        grid_map = np.zeros((grid_size, grid_size))     # initialize map as (564, 564)
+
+        
 
         grid_map[(grid_size - map_size[0])//2:
                  (grid_size - map_size[0])//2 + map_size[0],
                  (grid_size - map_size[1])//2:
                  (grid_size - map_size[1])//2 + map_size[1]] = sim_map
 
-        np.save(
-             os.path.join(map_dir,'grid_map.npy'),
-             grid_map
-        )
 
         if map_size[0] > map_size[1]:
             st = torch.tensor([[
@@ -894,8 +1010,7 @@ class Exploration_Env(habitat.RLEnv):
                              * map_size[1] * 1. / map_size[0],
                     (y - range_y/2.) * 2. / (range_y * scale),
                     180.0 + np.rad2deg(o)
-                ]])
-
+                ]])         # agent pose at t0
         else:
             st = torch.tensor([[
                     (x - range_x/2.) * 2. / (range_x * scale),
@@ -912,7 +1027,7 @@ class Exploration_Env(habitat.RLEnv):
         translated = F.grid_sample(grid_map, trans_mat)
         rotated = F.grid_sample(translated, rot_mat)
 
-        episode_map = torch.zeros((full_map_size, full_map_size)).float()
+        episode_map = torch.zeros((full_map_size, full_map_size)).float()       # full_map_zise = 480
         if full_map_size > grid_size:
             episode_map[(full_map_size - grid_size)//2:
                         (full_map_size - grid_size)//2 + grid_size,
@@ -929,22 +1044,11 @@ class Exploration_Env(habitat.RLEnv):
 
 
         episode_map = episode_map.numpy()
-        # episode_map[episode_map < 0] = 0.
-        # episode_map[episode_map == 5] = -1.
-        # episode_map[episode_map > 0] = 1.
-        # episode_map[episode_map == -1] = 5.
+        episode_map[episode_map > 0] = 1.
 
-        map_to_save = np.array(episode_map)
-        np.save(
-             os.path.join(map_dir,'episode_map_o.npy'),
-             map_to_save
-        )
-
-        obj_x, obj_y = self._get_topdown_point(full_map_size, 0)
-        print('\n')
-        print('===================')
-        print(obj_x, obj_y)
         
+
+
         return episode_map
 
 
@@ -1098,7 +1202,9 @@ class Exploration_Env(habitat.RLEnv):
 
         # allow sliding and physics
         sim.config.sim_cfg.allow_sliding = True
-        habitat_sim.SimulatorConfiguration().enable_physics = True
+        sim.config.sim_cfg.enable_physics = True
+        #sim.sim_cfg.sim_cfg.enable_physics = True
+        sim.sim_config.sim_cfg = sim.config.sim_cfg
 
 
         #first remove all existing objects
@@ -1139,26 +1245,61 @@ class Exploration_Env(habitat.RLEnv):
         locobot_template_id = obj_templates_mgr.load_object_configs(
             "data/objects/locobot_merged"
         )[0]
+        locobot_orientation = mn.Quaternion.rotation(mn.Deg(90.0), [-1.0, 0.0, 0.0])
+
+        sphere_template_id = obj_templates_mgr.load_configs(
+            "data/objects/sphere"
+        )[0]
 
         # add objects in initial position
+        #! version 0.0 of adding objects
+        # for i in range(self.obj_num):
+        #     locobot_template = obj_templates_mgr.get_template_by_id(locobot_template_id)
+        #     locobot_template.semantic_id = 10
+        #     obj_templates_mgr.register_template(locobot_template)
+        #     self.objects.append(
+        #         rigid_obj_mgr.add_object_by_template_id(locobot_template_id)
+        #     )
+        #     self.objects[i].translation = self.object_positions[2*i]
+        #     self.objects[i].collidable = True
+        #     print(f"added objects with objects id {self.objects[i].object_id}")
+        #     self.object_scene_nodes.append(self.objects[i].root_scene_node)
+
+        #     self.object_ids.append(self.objects[i].object_id)
+        #! version 0.0 end
+
+        #! version 1.0 of adding objects
         for i in range(self.obj_num):
-            locobot_template = obj_templates_mgr.get_template_by_id(locobot_template_id)
-            locobot_template.semantic_id = 1
-            obj_templates_mgr.register_template(locobot_template)
             self.objects.append(
                 rigid_obj_mgr.add_object_by_template_id(locobot_template_id)
             )
-            #self.objects[i].motion_type = habitat_sim.physics.MotionType.KINEMATIC
-            #self.objects[i].translation = self.object_positions[2*i]
-            self.objects[i].translation = self.object_positions[0]
-            self.objects[i].collidable = False
-            #self.objects[i].path = self.path[i]
+            self.objects[i].semantic_id = 10
+            self.objects[i].translation = self.object_positions[2 * i]
+            #self.objects[i].rotation = locobot_orientation
             print(f"added objects with objects id {self.objects[i].object_id}")
-            self.object_scene_nodes.append(self.objects[i].root_scene_node)
-            
-            #locobot_template.scale = [1.0 + i * 0.1, 1.0 + i * 0.1, 1.0 + i * 0.1]
-
             self.object_ids.append(self.objects[i].object_id)
+
+            if self.objects[i].object_id == -1:
+                print("something is wrong")
+                continue
+
+        sphere_obj = rigid_obj_mgr.add_object_by_template_id(sphere_template_id)
+        print(f"added object with objects id {sphere_obj.object_id}")
+        #sphere_obj.motion_type = habitat_sim.physics.MotionType.DYNAMIC
+        # sim.set_object_motion_type(
+        #     habitat_sim.physics.MotionType.STATIC, sphere_obj.object_id
+        # )
+        sphere_obj.translation = sim.agents[0].state.position + [0.0, 1.0, 1.0]
+        self.vel_control = sim.get_object_velocity_control(sphere_obj.object_id)
+        self.vel_control.linear_velocity = np.array([0, -1.0, 0.0])
+        self.vel_control.controlling_lin_vel = True
+        # target_diretion = mn.Vector3([0.0,0.0,-1.0])
+        # sphere_obj.linear_velocity = target_diretion * 3
+        # sphere_obj.angular_velocity = [0.0, -1.0, 0.0]
+        
+    
+
+        sim.recompute_navmesh(sim.pathfinder, self.navmesh_settings, True)
 
 
     def get_objects_and_paths(self):
@@ -1169,69 +1310,83 @@ class Exploration_Env(habitat.RLEnv):
 
     def _get_topdown_point(self, full_map_size, obj_id):
 
-        self.scene_name = self.habitat_env.sim.config.sim_cfg.scene_id
-        logger.error('Computing map for %s', self.scene_name)
+        # self.scene_name = self.habitat_env.sim.config.sim_cfg.scene_id
+        # logger.error('Computing map for %s', self.scene_name)
 
-        # Get map in habitat simulator coordinates
-        self.map_obj = HabitatMaps(self.habitat_env)
-        if self.map_obj.size[0] < 1 or self.map_obj.size[1] < 1:
-            logger.error("Invalid map: {}/{}".format(
-                            self.scene_name, self.episode_no))
-            return None
+        # # # Get map in habitat simulator coordinates
+        time_stamp_0 = time.time()
+        # self.map_obj = HabitatMaps(self.habitat_env)
+        # if self.map_obj.size[0] < 1 or self.map_obj.size[1] < 1:
+        #     logger.error("Invalid map: {}/{}".format(
+        #                     self.scene_name, self.episode_no))
+        #     return None
 
-        agent_y = self._env.sim.get_agent_state().position.tolist()[1]*100.
-        sim_map = self.map_obj.get_map(agent_y, -50., 50.0)
+        # agent_y = self._env.sim.get_agent_state().position.tolist()[1]*100.
+        # sim_map = self.map_obj.get_map(agent_y, -50., 50.0)
 
-        sim_map[sim_map > 0] = 1.
+        # sim_map[sim_map > 0] = 1.
+        # # sim_map[sim_map > 0] = 0.
+
+        sim_map = self.sim_map
+
+        time_stamp_1 = time.time()
+
+        print("section 1 runtime is %.2f" % (time_stamp_1 - time_stamp_0))
 
         # get object sim location
         obj_x, obj_y = -self.objects[obj_id].translation.b, -self.objects[obj_id].translation.r
+        #obj_x_, obj_y_ = -self.objects[obj_id].translation.b, -self.objects[obj_id].translation.r
+        agent_state = self._env.sim.get_agent_state(0)
+        #obj_x, obj_y = -agent_state.position[2], -agent_state.position[0]
+
+        obj_sim_pos = []
+        for point in self.path[obj_id].points:
+            position = np.array([-point[2], -point[0]])
+            obj_sim_pos.append(position)
+
+        # object_sim_pos = []
         # for point in self.path[0].points:
         #     position = np.array([-point[2], -point[0]])
         #     object_sim_pos.append(position)
 
-        print('\n')
-        print('=======================================')
-        print(f'object sim location {obj_x, obj_y}')
-        print('=======================================')
+        # # convert points to topdown map
+        # points_topdown = []
+        # min_x, min_y = self.map_obj.origin/100.0
+        # for pos in object_sim_pos:
+        #     px = (- pos[0] - min_x) * 20
+        #     py = (- pos[1] - min_y) * 20
+        #     points_topdown.append(np.array([px, py]))
+
+
+            
+        # for point in points_topdown:
+        #     sim_map[
+        #         int(point[1]) - 2: int(point[1]) + 2,
+        #         int(point[0]) - 2: int(point[0]) + 2
+        #     ] = 2
 
         # convert points to topdown map
         min_x, min_y = self.map_obj.origin/100.0
-        #obj_x, obj_y = (-obj_x -min_x) * 20 , (-obj_y - min_y) * 20 
+        obj_x, obj_y = (-obj_x -min_x) * 20 , (-obj_y - min_y) * 20
+       # obj_x_, obj_y_ =  (-obj_x_ -min_x) * 20 , (-obj_y_ - min_y) * 20 
 
-        # agent_state = super().habitat_env.sim.get_agent_state(0)
-        # agent_x = -agent_state.position[2]
-        # agent_y = -agent_state.position[0]
-        # agent_x, agent_y = (-agent_x -min_x) * 20 , (-agent_y - min_y) * 20 
-        # sim_map[
-        #     int(agent_y), int(agent_x)
-        # ] = 5
-        agent_state = super().habitat_env.sim.get_agent_state(0)
-        obj_x, obj_y = -agent_state.position[2], -agent_state.position[0]
-        obj_x, obj_y = (-obj_x -min_x) * 20 , (-obj_y - min_y) * 20 
         if int(obj_x) <= 1:
             obj_x += 1
         if int(obj_y) <= 1:
             obj_y += 1
+
         sim_map[
             int(obj_y),
             int(obj_x)
-        ] = 5
-
-        print('=======================================')
-        print(f"object map position: {obj_x, obj_y}")
-        print('=======================================')
-
-        map_dir = "data/results/neural_slam"
-        np.save(
-             os.path.join(map_dir,'sim_map_i.npy'),
-             sim_map
-        )
+        ] = 10
 
 
         # Transform the map to align with the agent
         min_x, min_y = self.map_obj.origin/100.0
-        x, y, o = self.get_sim_location()
+        if self.x is not None:
+            x, y, o = self.x, self.y, self.o
+        else:
+            x, y, o = self.get_sim_location()
         x, y = -x - min_x, -y - min_y
         range_x, range_y = self.map_obj.max/100. - self.map_obj.origin/100.
 
@@ -1245,12 +1400,10 @@ class Exploration_Env(habitat.RLEnv):
                  (grid_size - map_size[1])//2:
                  (grid_size - map_size[1])//2 + map_size[1]] = sim_map
 
-        grid_map[grid_map!=5] = 0.
 
-        np.save(
-             os.path.join(map_dir,'grid_map_o.npy'),
-             grid_map
-        )
+        time_stamp_2 = time.time()
+        print("section 2 runtime is %.2f" % (time_stamp_2 - time_stamp_1))
+
 
         if map_size[0] > map_size[1]:
             st = torch.tensor([[
@@ -1271,10 +1424,14 @@ class Exploration_Env(habitat.RLEnv):
         rot_mat, trans_mat = get_grid(st, (1, 1,
             grid_size, grid_size), torch.device("cpu"))
 
+        time_stamp_3 = time.time()
+
         grid_map = torch.from_numpy(grid_map).float()
         grid_map = grid_map.unsqueeze(0).unsqueeze(0)
         translated = F.grid_sample(grid_map, trans_mat)
         rotated = F.grid_sample(translated, rot_mat)
+
+        print("section 3 runtime is %.2f" % (time_stamp_3 - time_stamp_2))
 
         episode_map = torch.zeros((full_map_size, full_map_size)).float()
         if full_map_size > grid_size:
@@ -1293,16 +1450,20 @@ class Exploration_Env(habitat.RLEnv):
 
 
         episode_map = episode_map.numpy()
-        # episode_map[episode_map < 0] = 0.
-        # episode_map[episode_map == 5] = -1.
-        # episode_map[episode_map > 0] = 5.
+        
+        cor_x, cor_y = int(np.where(episode_map==episode_map.max())[0]), int(np.where(episode_map==episode_map.max())[1])
+
+        time_stamp_4 = time.time()
+        print("section 4 runtime is %.2f" % (time_stamp_4 - time_stamp_3))
 
 
-        map_to_save = np.array(episode_map)
-        np.save(
-             os.path.join(map_dir,'episode_map_i.npy'),
-             map_to_save
-        )
+        return cor_x, cor_y
 
 
-        return int(np.where(episode_map==episode_map.max())[0]), int(np.where(episode_map==episode_map.max())[1])
+
+class Sem_Exp_Env(Exploration_Env):
+    """ The semantic exploration env class, inhereted from Explore_Env with extended functions like obs pre-processsing.
+    """
+
+    def __init__(self, args, rank, config_env, config_baseline, dataset):
+        super().__init__(args, rank, config_env, config_baseline, dataset)
